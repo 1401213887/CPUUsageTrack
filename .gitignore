@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+.eggs/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Logs (运行时生成)
+logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# WorkBuddy internal
+.workbuddy/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Virtual environments
+venv/
+.venv/
+env/
