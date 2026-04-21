@@ -1,13 +1,15 @@
 """CPU 监控引擎 - QThread 工作线程
 
-核心设计：分级采集，极低 CPU 开销
+核心设计：极低 CPU 开销的分级采集
 - 总体 CPU：优先使用 Windows PDH Processor Utility（与任务管理器一致），
   fallback 到 psutil cpu_percent
-- 告警路径：仅超阈值+冷却期后才遍历进程
-- 停止响应：通过分片 sleep 实现 ~100ms 级别的停止响应
+- 常规路径（每秒）：只采集总体 CPU，不遍历任何进程（O(1) 开销）
+- 告警路径（极低频）：仅超阈值+冷却期后，启动自包含的两次采样收集 Top N 进程
+- 停止响应：通过 Event.wait(timeout) 实现 ~100ms 级别的停止响应
 """
 import time
 import threading
+import os as _os
 
 import psutil
 from PyQt5.QtCore import QThread, pyqtSignal
@@ -70,19 +72,14 @@ class CPUMonitorThread(QThread):
     def _interruptible_sleep(self, duration: float) -> bool:
         """可中断的精确睡眠
 
-        将长 sleep 切分为 ≤100ms 的小片段，每片段检查 stop 信号。
+        使用 Event.wait(timeout) 实现，被 stop 时立即返回。
         Returns:
             True 如果正常完成睡眠，False 如果被中断
         """
-        slice_sec = 0.1  # 100ms 检查粒度
-        remaining = duration
-        while remaining > 0:
-            if self._stop_event.is_set():
-                return False
-            wait_time = min(slice_sec, remaining)
-            self._stop_event.wait(timeout=wait_time)
-            remaining -= wait_time
-        return True
+        # Event.wait 内部用高效的 OS 原语，无需手动分片
+        # stop_event 被 set 时立即唤醒
+        interrupted = self._stop_event.wait(timeout=duration)
+        return not interrupted  # True = 正常超时完成, False = 被中断
 
     def run(self):
         """采集主循环
@@ -91,18 +88,16 @@ class CPUMonitorThread(QThread):
         1. Windows PDH: % Processor Utility（与任务管理器一致，反映 Turbo Boost）
         2. psutil cpu_percent（fallback，传统 % Processor Time）
 
-        进程级 CPU 使用 psutil process_iter，但通过动态频率校正系数
-        (PDH Utility / psutil Time) 对齐到 Utility 口径。
+        关键优化：常规路径零进程遍历，仅在告警时按需采集进程数据。
         """
         # 初始化 PDH（如果可用）
         use_pdh = False
         if _HAS_PDH:
             use_pdh = init_cpu_utility()
 
-        # psutil 预热（始终需要，进程级 CPU 依赖它）
-        psutil.cpu_percent(interval=None)
-        for _p in psutil.process_iter(attrs=['cpu_percent']):
-            pass
+        # psutil 预热（仅 fallback 模式需要）
+        if not use_pdh:
+            psutil.cpu_percent(interval=None)
 
         while not self._stop_event.is_set():
             # 检查暂停状态
@@ -114,63 +109,61 @@ class CPUMonitorThread(QThread):
             if not self._interruptible_sleep(self._interval):
                 break  # 被中断，退出
 
-            # 采样总体 CPU
-            # 始终调用 psutil 维护基线（进程级 CPU 依赖它）
-            psu_time = psutil.cpu_percent(interval=None)
-            freq_factor = 1.0  # 频率校正系数
-
+            # ── 常规路径：只采集总体 CPU，不遍历任何进程 ──
             if use_pdh:
-                pdh_utility = get_cpu_utility()
-                if pdh_utility >= 0:
-                    cpu_pct = pdh_utility
-                    # 动态频率校正系数：Utility / Time
-                    if psu_time > 0.1:
-                        freq_factor = pdh_utility / psu_time
-                else:
-                    cpu_pct = psu_time
+                cpu_pct = get_cpu_utility()
+                if cpu_pct < 0:
+                    # PDH 偶发失败，fallback 到 psutil
+                    cpu_pct = psutil.cpu_percent(interval=None)
             else:
-                cpu_pct = psu_time
+                cpu_pct = psutil.cpu_percent(interval=None)
 
             now = time.time()
             self.cpu_data_signal.emit(now, cpu_pct)
 
-            # --- 告警路径：仅超阈值+冷却期后 ---
+            # ── 告警路径：仅超阈值+冷却期后，启动独立两次采样 ──
             if cpu_pct >= self._threshold:
                 if (now - self._last_alert_time) >= self._log_cooldown:
                     self._last_alert_time = now
+                    # 计算频率校正系数（仅告警时需要）
+                    freq_factor = 1.0
+                    if use_pdh:
+                        psu_time = psutil.cpu_percent(interval=None)
+                        if psu_time > 0.1:
+                            freq_factor = cpu_pct / psu_time
                     processes = self._collect_top_processes(10, freq_factor)
-                    self.alert_signal.emit(cpu_pct, processes)
-                else:
-                    # 超阈值但在冷却期内，仍需遍历进程为下次预热
-                    for _p in psutil.process_iter(attrs=['cpu_percent']):
-                        pass
-            else:
-                # 非告警时也遍历一次进程，为下个周期预热 cpu_percent 基线
-                for _p in psutil.process_iter(attrs=['cpu_percent']):
-                    pass
+                    if processes is not None:
+                        self.alert_signal.emit(cpu_pct, processes)
 
     # 不应出现在 Top 列表中的系统伪进程
     _SKIP_NAMES = {'System Idle Process', 'Idle', 'kernel_task'}
 
-    def _collect_top_processes(self, top_n: int = 10, freq_factor: float = 1.0) -> list:
-        """收集 CPU 占用 Top N 进程
+    def _collect_top_processes(self, top_n: int = 10, freq_factor: float = 1.0) -> list | None:
+        """收集 CPU 占用 Top N 进程（自包含两次采样模式）
 
-        前提：主循环每个周期都遍历过 process_iter（预热了各进程的
-        cpu_percent 基线），所以这里直接读取即可获得与总体 CPU
-        同一采样窗口的数据。
+        不依赖外部预热。内部完成：
+        1. 第一轮遍历：预热所有进程的 cpu_percent 基线
+        2. 等待采样窗口（~1 秒，可中断）
+        3. 第二轮遍历：读取真实 CPU 使用值
 
         Args:
             top_n: 返回 Top N 个进程
-            freq_factor: 频率校正系数 = PDH Utility / psutil Time，
-                         用于将进程 CPU（基于 Processor Time）校正到
-                         Processor Utility 口径（与任务管理器一致）
+            freq_factor: 频率校正系数 = PDH Utility / psutil Time
 
         Returns:
-            list of dict: [{'pid': int, 'name': str, 'cpu_percent': float}, ...]
+            list of dict 或 None（被中断时返回 None）
         """
-        import os as _os
-
         num_cores = psutil.cpu_count(logical=True) or 1
+
+        # ── 第一轮：预热所有进程的 cpu_percent 基线 ──
+        for _p in psutil.process_iter(attrs=['cpu_percent']):
+            pass
+
+        # ── 等待采样窗口（可中断）──
+        if not self._interruptible_sleep(1.0):
+            return None  # 被中断
+
+        # ── 第二轮：读取真实值 ──
         procs = []
         for proc in psutil.process_iter(attrs=['pid', 'name', 'cpu_percent', 'exe']):
             try:

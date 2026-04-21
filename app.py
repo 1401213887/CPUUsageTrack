@@ -5,8 +5,9 @@
 """
 import csv
 import time
-from collections import deque
 from datetime import datetime
+
+import numpy as np
 
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -273,9 +274,11 @@ class MainWindow(QMainWindow):
         self._monitor_thread = None
         self._alert_logger = AlertLogger(self._config.log_dir)
 
-        # 数据存储
-        self._timestamps = deque(maxlen=self._config.max_data_points)
-        self._cpu_values = deque(maxlen=self._config.max_data_points)
+        # 数据存储（预分配 numpy 环形缓冲区，避免每秒 deque→list 转换）
+        self._max_points = self._config.max_data_points
+        self._ts_buf = np.empty(self._max_points, dtype=np.float64)
+        self._cpu_buf = np.empty(self._max_points, dtype=np.float64)
+        self._buf_count = 0  # 当前缓冲区中的有效数据点数
         self._start_time = None
         self._alert_count = 0
         self._is_running = False
@@ -398,9 +401,9 @@ class MainWindow(QMainWindow):
         chart.getAxis('left').setLabel('CPU %', color=TEXT_SECONDARY)
         chart.getAxis('bottom').setLabel('时间', color=TEXT_SECONDARY)
 
-        # 曲线
+        # 曲线（启用 clipToView 减少不可见数据点的渲染开销）
         pen = pg.mkPen(color=COLOR_PRIMARY, width=2)
-        self._curve = chart.plot([], [], pen=pen)
+        self._curve = chart.plot([], [], pen=pen, clipToView=True, skipFiniteCheck=True)
 
         # 填充基线（预创建，避免每次 _on_cpu_data 新建对象导致内存泄漏）
         self._baseline = pg.PlotDataItem([0], [0])
@@ -548,7 +551,7 @@ class MainWindow(QMainWindow):
             # 停止状态
             self._btn_start.setEnabled(True)
             self._btn_pause.setEnabled(False)
-            self._btn_save.setEnabled(len(self._timestamps) > 0)
+            self._btn_save.setEnabled(self._buf_count > 0)
             self._btn_stop.setEnabled(False)
         elif self._is_paused:
             # 暂停状态
@@ -569,8 +572,7 @@ class MainWindow(QMainWindow):
 
     def _on_start(self):
         """开始监控"""
-        self._timestamps.clear()
-        self._cpu_values.clear()
+        self._buf_count = 0  # 重置缓冲区（无需清空数组，count 控制有效范围）
         self._alert_count = 0
         self._alert_label['value'].setText("0")
         self._start_time = time.time()
@@ -615,17 +617,20 @@ class MainWindow(QMainWindow):
 
     def _on_save(self):
         """保存数据为 CSV"""
-        if not self._timestamps:
+        if self._buf_count == 0:
             return
         filepath, _ = QFileDialog.getSaveFileName(
             self, "保存监控数据", f"cpu_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             "CSV 文件 (*.csv)"
         )
         if filepath:
+            count = self._buf_count
             with open(filepath, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 writer.writerow(['timestamp', 'datetime', 'cpu_percent'])
-                for ts, cpu in zip(self._timestamps, self._cpu_values):
+                for i in range(count):
+                    ts = self._ts_buf[i]
+                    cpu = self._cpu_buf[i]
                     dt = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
                     writer.writerow([f"{ts:.3f}", dt, f"{cpu:.1f}"])
 
@@ -696,27 +701,41 @@ class MainWindow(QMainWindow):
 
     def _on_cpu_data(self, timestamp: float, cpu_percent: float):
         """接收 CPU 数据（主线程 slot）"""
-        self._timestamps.append(timestamp)
-        self._cpu_values.append(cpu_percent)
+        # 写入环形缓冲区
+        n = self._buf_count
+        if n < self._max_points:
+            self._ts_buf[n] = timestamp
+            self._cpu_buf[n] = cpu_percent
+            self._buf_count = n + 1
+        else:
+            # 缓冲区满，左移一位丢弃最老数据
+            self._ts_buf[:-1] = self._ts_buf[1:]
+            self._cpu_buf[:-1] = self._cpu_buf[1:]
+            self._ts_buf[-1] = timestamp
+            self._cpu_buf[-1] = cpu_percent
 
-        # 更新曲线
-        if len(self._timestamps) > 1:
-            ts_list = list(self._timestamps)
-            cpu_list = list(self._cpu_values)
-            # X 轴用相对秒数（从第一个数据点算起）
-            t0 = ts_list[0]
-            x_data = [t - t0 for t in ts_list]
-            self._curve.setData(x_data, cpu_list)
+        count = self._buf_count
 
-            # 更新填充的基线（复用预创建对象，不新建）
-            zeros = [0] * len(x_data)
-            self._baseline.setData(x_data, zeros)
-            self._fill.setCurves(self._curve, self._baseline)
+        # 更新曲线（至少 2 个点才绘制）
+        if count > 1:
+            # numpy slice，零拷贝视图
+            ts_slice = self._ts_buf[:count]
+            cpu_slice = self._cpu_buf[:count]
 
-            # 手动管理 X 轴范围：显示最近 60 秒的滚动窗口，始终从 0 开始
+            # 向量化计算相对时间
+            t0 = ts_slice[0]
+            x_data = ts_slice - t0
+
+            self._curve.setData(x_data, cpu_slice)
+
+            # 更新基线的 x 坐标（零数组只在长度变化时重建）
+            if not hasattr(self, '_baseline_zeros') or len(self._baseline_zeros) != count:
+                self._baseline_zeros = np.zeros(count, dtype=np.float64)
+            self._baseline.setData(x_data, self._baseline_zeros)
+
+            # X 轴滚动窗口
             x_max = x_data[-1]
-            window = max(60, x_max)  # 至少 60 秒宽度
-            x_start = max(0, x_max - 300)  # 最多显示最近 300 秒
+            x_start = max(0, x_max - 300)
             self._chart.setXRange(x_start, x_max + 2, padding=0)
 
         # 更新 CPU 数值显示（仅颜色变化时重设样式）
