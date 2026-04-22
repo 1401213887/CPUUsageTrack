@@ -215,51 +215,58 @@ class _SnapshotThread(QThread):
 
         # ── 第二轮：采集真实值 ──
         # 总体 CPU：优先 PDH Utility（与任务管理器一致）
-        # 同时获取 psutil Time，用于计算频率校正系数
         psu_time = _psutil.cpu_percent(interval=None)
-        freq_factor = 1.0
 
         if use_pdh:
             cpu_pct = get_cpu_utility()
             if cpu_pct < 0:
                 cpu_pct = psu_time
-            elif psu_time > 0.1:
-                freq_factor = cpu_pct / psu_time
         else:
             cpu_pct = psu_time
 
-        procs = []
+        # 先收集所有进程的原始 CPU 值
+        raw_procs = []
+        raw_sum = 0.0
         for pid, (proc, raw_name, exe_path) in proc_snapshot.items():
             try:
-                # 第二次调用：返回过去 1 秒的真实 CPU 占用
                 pct = proc.cpu_percent()
                 if pct is None:
                     continue
 
-                # 多级 fallback 获取进程名
                 name = raw_name
                 if not name and exe_path:
                     name = _os.path.basename(exe_path)
                 if not name:
                     name = f'[PID:{pid}]'
 
-                # 跳过系统伪进程
                 if name in self._SKIP_NAMES:
                     continue
 
-                # 归一化到单核百分比，并乘以频率校正系数
-                normalized_pct = pct / num_cores * freq_factor
-                normalized_pct = round(min(100.0, normalized_pct), 2)
+                raw_pct = pct / num_cores
+                raw_sum += raw_pct
 
-                # 尝试读取 exe 的中文描述名
                 display_name = self._get_file_description(exe_path) or name
-                procs.append({
+                raw_procs.append({
                     'pid': pid,
                     'name': display_name,
-                    'cpu_percent': normalized_pct
+                    'raw_pct': raw_pct
                 })
             except (_psutil.NoSuchProcess, _psutil.AccessDenied, _psutil.ZombieProcess):
                 continue
+
+        # 按比例分配：进程 CPU = (raw_pct / raw_sum) * total_cpu
+        # 保证进程累加值 = 总体 CPU，不存在 freq_factor 波动
+        procs = []
+        for p in raw_procs:
+            if raw_sum > 0.01:
+                adjusted_pct = p['raw_pct'] / raw_sum * cpu_pct
+            else:
+                adjusted_pct = p['raw_pct']
+            procs.append({
+                'pid': p['pid'],
+                'name': p['name'],
+                'cpu_percent': round(min(100.0, adjusted_pct), 2)
+            })
 
         procs.sort(key=lambda x: x['cpu_percent'], reverse=True)
         self.finished_signal.emit(cpu_pct, procs[:20])

@@ -125,37 +125,36 @@ class CPUMonitorThread(QThread):
             if cpu_pct >= self._threshold:
                 if (now - self._last_alert_time) >= self._log_cooldown:
                     self._last_alert_time = now
-                    # 计算频率校正系数（仅告警时需要）
-                    freq_factor = 1.0
-                    if use_pdh:
-                        psu_time = psutil.cpu_percent(interval=None)
-                        if psu_time > 0.1:
-                            freq_factor = cpu_pct / psu_time
-                    processes = self._collect_top_processes(10, freq_factor)
-                    if processes is not None:
-                        self.alert_signal.emit(cpu_pct, processes)
+                    result = self._collect_top_processes(10, use_pdh)
+                    if result is not None:
+                        alert_cpu, processes = result
+                        self.alert_signal.emit(alert_cpu, processes)
 
     # 不应出现在 Top 列表中的系统伪进程
     _SKIP_NAMES = {'System Idle Process', 'Idle', 'kernel_task'}
 
-    def _collect_top_processes(self, top_n: int = 10, freq_factor: float = 1.0) -> list | None:
+    def _collect_top_processes(self, top_n: int = 10, use_pdh: bool = False) -> tuple[float, list] | None:
         """收集 CPU 占用 Top N 进程（自包含两次采样模式）
 
-        不依赖外部预热。内部完成：
-        1. 第一轮遍历：预热所有进程的 cpu_percent 基线
+        不依赖外部预热或校正系数。内部完成：
+        1. 第一轮遍历：预热所有进程的 cpu_percent 基线 + psutil 总体基线
         2. 等待采样窗口（~1 秒，可中断）
         3. 第二轮遍历：读取真实 CPU 使用值
+        4. 按比例分配：每个进程 CPU = (raw_pct / raw_sum) * total_cpu
+           这保证 Top N 进程的占比关系正确，且累加值与总体一致
 
         Args:
             top_n: 返回 Top N 个进程
-            freq_factor: 频率校正系数 = PDH Utility / psutil Time
+            use_pdh: 是否使用 PDH Utility 作为总体基准
 
         Returns:
-            list of dict 或 None（被中断时返回 None）
+            (total_cpu, list of dict) 或 None（被中断时返回 None）
+            total_cpu 是采样窗口内的真实总体 CPU，与进程列表同一时刻
         """
         num_cores = psutil.cpu_count(logical=True) or 1
 
-        # ── 第一轮：预热所有进程的 cpu_percent 基线 ──
+        # ── 第一轮：预热所有进程 + psutil 总体基线 ──
+        psutil.cpu_percent(interval=None)
         for _p in psutil.process_iter(attrs=['cpu_percent']):
             pass
 
@@ -164,7 +163,17 @@ class CPUMonitorThread(QThread):
             return None  # 被中断
 
         # ── 第二轮：读取真实值 ──
-        procs = []
+        # 先获取总体值（两种口径）
+        psu_time = psutil.cpu_percent(interval=None)
+        total_cpu = psu_time  # fallback
+        if use_pdh and _HAS_PDH:
+            pdh_util = get_cpu_utility()
+            if pdh_util >= 0:
+                total_cpu = pdh_util
+
+        # 收集所有进程的原始 CPU（归一化到 0-100%）
+        raw_procs = []
+        raw_sum = 0.0
         for proc in psutil.process_iter(attrs=['pid', 'name', 'cpu_percent', 'exe']):
             try:
                 info = proc.info
@@ -192,17 +201,31 @@ class CPUMonitorThread(QThread):
                 if raw_name in self._SKIP_NAMES:
                     continue
 
-                # 归一化到单核百分比，并乘以频率校正系数
-                normalized_pct = info['cpu_percent'] / num_cores * freq_factor
-                normalized_pct = round(min(100.0, normalized_pct), 2)
-                procs.append({
+                # 归一化到 0-100% 单核口径
+                raw_pct = info['cpu_percent'] / num_cores
+                raw_sum += raw_pct
+                raw_procs.append({
                     'pid': pid,
                     'name': raw_name,
-                    'cpu_percent': normalized_pct
+                    'raw_pct': raw_pct
                 })
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
 
+        # 按比例分配：进程 CPU = (raw_pct / raw_sum) * total_cpu
+        # 这样进程累加值天然 = total_cpu，不存在乘法校正的波动问题
+        procs = []
+        for p in raw_procs:
+            if raw_sum > 0.01:
+                adjusted_pct = p['raw_pct'] / raw_sum * total_cpu
+            else:
+                adjusted_pct = p['raw_pct']
+            procs.append({
+                'pid': p['pid'],
+                'name': p['name'],
+                'cpu_percent': round(min(100.0, adjusted_pct), 2)
+            })
+
         # 按 CPU 占用率降序排序，取 Top N
         procs.sort(key=lambda x: x['cpu_percent'], reverse=True)
-        return procs[:top_n]
+        return total_cpu, procs[:top_n]
